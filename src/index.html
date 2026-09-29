@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Flick</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; user-select: none; -webkit-user-select: none; font: 13px -apple-system, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; cursor: crosshair; }
+  #bar { position: fixed; display: none; gap: 2px; align-items: center; padding: 5px 6px; background: #1d1d1f; border-radius: 9px; box-shadow: 0 6px 24px #0008; z-index: 5; }
+  #bar button { all: unset; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px; color: #eee; cursor: pointer; font-size: 16px; }
+  #bar button:hover { background: #ffffff22; }
+  #bar button.on { background: #ff5a3c; color: #fff; }
+  #bar .sep { width: 1px; height: 20px; background: #ffffff30; margin: 0 4px; }
+  #bar .sw { width: 18px; height: 18px; border-radius: 50%; margin: 0 3px; cursor: pointer; border: 2px solid transparent; box-sizing: border-box; }
+  #bar .sw.on { border-color: #fff; }
+  #bar .sz { width: 26px; }
+  #toast { position: fixed; top: 22px; left: 50%; transform: translateX(-50%); background: #1d1d1f; color: #fff; padding: 8px 16px; border-radius: 20px; font-weight: 600; opacity: 0; transition: opacity .15s; pointer-events: none; z-index: 9; }
+  #toast.show { opacity: 1; }
+  #txt { position: fixed; display: none; z-index: 6; background: #0004; border: 1px dashed #fff; outline: none; padding: 0 2px; font-family: -apple-system, system-ui, sans-serif; font-weight: 700; min-width: 40px; user-select: text; -webkit-user-select: text; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar"></div>
+<div id="toast"></div>
+<input id="txt" autocomplete="off">
+<script src="main.js"></script>
+</body>
+</html>
