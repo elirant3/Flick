@@ -26,7 +26,12 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-const DEFAULT_SHORTCUT: &str = "Super+Shift+A";
+/// ⌘⇧2: unused by macOS and next to its own ⌘⇧3/4/5 screenshot keys. (⌘⇧A would be taken away
+/// from every other app while Flick runs: Finder's Go to Applications, Chrome's tab search...)
+const DEFAULT_SHORTCUT: &str = "Super+Shift+2";
+/// Menu bar icon: black on transparent, drawn by `scripts/gen_tray_icon.php`. Used as a template
+/// image so macOS tints it for light and dark menu bars.
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-template.png");
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bounds for data coming back from the webview (defence in depth; it is our own page).
 const MAX_DIMENSION: usize = 32_768;
@@ -430,11 +435,9 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit Flick", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&capture_item, &quit_item])?;
             TrayIconBuilder::new()
-                .icon(
-                    app.default_window_icon()
-                        .expect("bundle has an icon")
-                        .clone(),
-                )
+                .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
+                .icon_as_template(true)
+                .tooltip("Flick")
                 .menu(&menu)
                 .on_menu_event(|app, ev| match ev.id().as_ref() {
                     "capture" => {
@@ -475,6 +478,25 @@ mod tests {
     #[test]
     fn default_shortcut_parses() {
         assert!(DEFAULT_SHORTCUT.parse::<Shortcut>().is_ok());
+    }
+
+    #[test]
+    fn default_shortcut_is_not_cmd_shift_a() {
+        use tauri_plugin_global_shortcut::{Code, Modifiers};
+        let s: Shortcut = DEFAULT_SHORTCUT.parse().unwrap();
+        assert_eq!(s, Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2));
+    }
+
+    #[test]
+    fn tray_icon_is_a_template_image() {
+        let icon = tauri::image::Image::from_bytes(TRAY_ICON).expect("tray icon decodes");
+        assert_eq!((icon.width(), icon.height()), (44, 44));
+        // Template images are pure black with alpha; any colour would show untinted.
+        assert!(icon
+            .rgba()
+            .chunks(4)
+            .all(|p| p[3] == 0 || (p[0] == 0 && p[1] == 0 && p[2] == 0)));
+        assert!(icon.rgba().chunks(4).any(|p| p[3] > 200), "icon is not empty");
     }
 
     #[test]

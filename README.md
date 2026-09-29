@@ -2,7 +2,7 @@
 
 A Flameshot-style screenshot tool for macOS. Built with Rust + Tauri.
 
-Press **⌘⇧A**, drag a region, and it's on your clipboard. Annotate if you want; the clipboard updates after every change.
+Press **⌘⇧2**, drag a region, annotate if you want, and press **Enter**: it's on your clipboard. Cancelling never touches the clipboard.
 
 ## Tools
 
@@ -11,9 +11,9 @@ Pen (P) · Line (L) · Arrow (A) · Rectangle (R) · Circle (E) · Marker (M) ·
 | Key | Action |
 | --- | --- |
 | Enter / ⌘C | Copy and close |
-| ⌘S | Save PNG to Desktop and close |
+| ⌘S | Save PNG to Desktop, copy, and close |
 | ⌘Z | Undo |
-| Esc / right-click | Cancel |
+| Esc / right-click / switching apps | Cancel (the clipboard is left as it was) |
 | Shift (while drawing) | Snap lines and arrows to 45° |
 
 Captures the display your cursor is on. Launching Flick a second time also triggers a capture.
@@ -35,7 +35,7 @@ On first capture, allow Flick under System Settings → Privacy & Security → S
 
 ## Config
 
-Change the hotkey in `~/Library/Application Support/Flick/config.json`:
+The default hotkey is ⌘⇧2: macOS doesn't use it, and it sits next to the system's own ⌘⇧3/4/5. (A global hotkey is taken away from every other app while Flick runs, which is why it isn't ⌘⇧A: that belongs to Finder's Go to Applications and Chrome's tab search.) Change it in `~/Library/Application Support/Flick/config.json`:
 
 ```json
 { "shortcut": "Super+Shift+X" }
@@ -46,6 +46,8 @@ If the hotkey is taken by another app Flick still starts; use the menu bar item 
 ## Design notes
 
 - **Memory:** the screenshot moves to the overlay as a raw binary IPC response (no base64/JSON), the full-screen bitmap is freed on close, and the pixel buffer for the clipboard is released immediately after sending. Nothing is cached on disk.
+- **Clipboard on commit only:** drawing never exports anything; the crop is rendered once when you press Enter, ⌘C or ⌘S (⌘S reuses that one render for the file and the clipboard).
+- **Menu bar icon:** a black-on-transparent template image (`scripts/gen_tray_icon.php`), so macOS tints it for light and dark menu bars.
 - **Temp files:** the capture goes to a private (0600) unique temp file that is deleted right away, including on error paths.
 - **Least privilege:** strict CSP (no inline script/style, no remote origins), frozen prototypes, and the overlay window may only call four app commands plus event listening. The webview can't touch the filesystem or shell.
 - **Input validation:** clipboard/save payloads are size-checked (`width × height × 4` must match exactly, 32 768 px and 512 MB caps); saves never overwrite an existing file.

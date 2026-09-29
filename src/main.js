@@ -22,7 +22,6 @@ let anns = [];                  // committed annotations
 let cur = null;                 // annotation being drawn
 let tool = 'pen', color = COLORS[0], size = SIZES[1];
 let drag = null;                // {mode:'new'|'handle'|'draw', ...}
-let copyTimer = null;
 
 // ---------- setup ----------
 function fit() {
@@ -208,13 +207,13 @@ cv.addEventListener('pointerup', () => {
   const mode = drag.mode; drag = null;
   if (mode === 'new') {
     if (!sel || sel.w < 4 || sel.h < 4) { sel = null; render(); return; }
-    buildBar(); placeBar(); scheduleCopy(true);
+    buildBar(); placeBar();
   } else if (mode === 'handle') {
-    placeBar(); scheduleCopy();
+    placeBar();
   } else if (mode === 'draw' && cur) {
     const moved = cur.pts.length > 1 || Math.hypot(cur.x2 - cur.x1, cur.y2 - cur.y1) > 2;
     if (moved || cur.tool === 'pen') anns.push(cur);
-    cur = null; scheduleCopy();
+    cur = null;
   }
   render();
 });
@@ -232,7 +231,6 @@ function commitText() {
   const v = txt.value.trim();
   if (v && textPos) {
     anns.push({ tool: 'text', color: txt.style.color, fs: parseInt(txt.style.fontSize, 10), text: v, x1: textPos.x + 2, y1: textPos.y, size: 1 });
-    scheduleCopy();
   }
   txt.style.display = 'none'; txt.value = ''; textPos = null; render();
 }
@@ -262,49 +260,55 @@ function exportCanvas() {
 }
 const release = (canvas) => { canvas.width = canvas.height = 0; };  // free the backing store right away
 
-let ipcQueue = Promise.resolve();  // serialises clipboard writes so the newest edit always lands last
-function copyToClipboard(quiet) {
-  if (!sel || !img) return Promise.resolve(false);
-  const out = exportCanvas();  // snapshot now, send later
+// The clipboard is written only when the user commits (Enter, ⌘C, ✓, ⌘S). Cancelling (Esc, ✕,
+// right-click, Cmd+Tab away) leaves whatever was on the clipboard untouched, and drawing never
+// pays for an export.
+async function sendToClipboard(out) {
   const { width, height } = out;
   const px = out.getContext('2d').getImageData(0, 0, width, height).data;
-  release(out);
   const body = new Uint8Array(px.buffer, px.byteOffset, px.byteLength);
-  const job = ipcQueue
-    .then(() => invoke('copy_image', body, { headers: { 'x-width': String(width), 'x-height': String(height) } }))
-    .then(() => { if (!quiet) toast('Copied to clipboard ✓'); return true; },
-          (err) => { toast('Copy failed: ' + err); return false; });
-  ipcQueue = job;
-  return job;
-}
-function scheduleCopy(first) {
-  clearTimeout(copyTimer);
-  copyTimer = setTimeout(() => copyToClipboard(false), first ? 0 : 250);
+  try {
+    await invoke('copy_image', body, { headers: { 'x-width': String(width), 'x-height': String(height) } });
+    return true;
+  } catch (err) {
+    toast('Copy failed: ' + err);
+    return false;
+  }
 }
 let toastT;
 function toast(msg) {
   toastEl.textContent = msg; toastEl.classList.add('show');
   clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove('show'), 1400);
 }
+let committing = false;  // Enter pressed twice must not export twice
 async function done() {
-  commitText(); clearTimeout(copyTimer);
-  if (await copyToClipboard(true)) close();  // stay open if the copy failed so nothing is lost
+  commitText();
+  if (!sel || !img || committing) return;
+  committing = true;
+  const out = exportCanvas();
+  const ok = await sendToClipboard(out);
+  release(out);
+  committing = false;
+  if (ok) close();  // stay open if the copy failed so nothing is lost
 }
 async function saveFile() {
-  commitText(); clearTimeout(copyTimer);
-  if (!sel || !img) return;
-  const out = exportCanvas();
+  commitText();
+  if (!sel || !img || committing) return;
+  committing = true;
+  const out = exportCanvas();  // rendered once, used for both the file and the clipboard
   const blob = await new Promise((resolve) => out.toBlob(resolve, 'image/png'));
+  const copied = await sendToClipboard(out);
   release(out);
+  committing = false;
   if (!blob) { toast('Save failed'); return; }
-  await copyToClipboard(true);
-  try { await invoke('save_image', new Uint8Array(await blob.arrayBuffer())); close(); }
-  catch (err) { toast('Save failed: ' + err); }
+  try {
+    await invoke('save_image', new Uint8Array(await blob.arrayBuffer()));
+    if (copied) close();
+  } catch (err) { toast('Save failed: ' + err); }
 }
-function undo() { commitText(); anns.pop(); render(); scheduleCopy(); }
+function undo() { commitText(); anns.pop(); render(); }
 function close() {
-  clearTimeout(copyTimer);
-  drag = null; cur = null; sel = null; anns = []; armed = false;
+  drag = null; cur = null; sel = null; anns = []; armed = false; committing = false;
   if (img) { img.close(); img = null; }  // release the full-screen bitmap
   bar.style.display = 'none'; txt.style.display = 'none';
   ctx.clearRect(0, 0, innerWidth, innerHeight);
@@ -329,9 +333,25 @@ addEventListener('focus', () => { armed = true; });
 addEventListener('blur', () => { if (armed && img) close(); });
 
 // ---------- lifecycle ----------
-listen('shot', async () => {
+// The backend stores the screenshot, emits `shot`, then shows this window. If the hotkey is
+// pressed while this page is still loading, that event is lost, so the page also asks once at
+// startup. Both paths share one in-flight request, so the screenshot is never taken twice.
+let pulling = null;
+function pull(fromEvent) {
+  if (!pulling) pulling = doPull(fromEvent).finally(() => { pulling = null; });
+  return pulling;
+}
+async function doPull(fromEvent) {
+  let png;
   try {
-    const png = await invoke('take_shot');  // raw binary IPC response, no base64
+    png = await invoke('take_shot');  // raw binary IPC response, no base64
+  } catch (err) {
+    // Nothing pending is normal on the startup check; after an event it means the overlay
+    // would open empty, so close it (unless another pull already filled it).
+    if (fromEvent && !img) invoke('hide_overlay').catch(console.error);
+    return;
+  }
+  try {
     const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
     if (img) img.close();
     fit(); img = bitmap; sel = null; anns = []; cur = null; render();
@@ -340,5 +360,6 @@ listen('shot', async () => {
     console.error(err);
     invoke('hide_overlay').catch(console.error);
   }
-});
+}
+listen('shot', () => pull(true)).then(() => pull(false));
 fit();
