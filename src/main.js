@@ -16,7 +16,7 @@ const TOOLS = [
 ];
 const KEYS = { p: 'pen', l: 'line', a: 'arrow', r: 'rect', e: 'ellipse', m: 'marker', t: 'text' };
 
-let img = null;                 // frozen screenshot
+let img = null;                 // frozen screenshot (ImageBitmap)
 let sel = null;                 // {x,y,w,h} in CSS px
 let anns = [];                  // committed annotations
 let cur = null;                 // annotation being drawn
@@ -140,8 +140,8 @@ function render() {
   ctx.fillStyle = '#1d1d1f'; ctx.fillRect(sel.x, ly, tw, 18);
   ctx.fillStyle = '#fff'; ctx.textBaseline = 'middle'; ctx.fillText(label, sel.x + 6, ly + 9);
 }
-const scaleX = () => img.naturalWidth / innerWidth;
-const scaleY = () => img.naturalHeight / innerHeight;
+const scaleX = () => img.width / innerWidth;
+const scaleY = () => img.height / innerHeight;
 
 // ---------- selection handles ----------
 function handles() {
@@ -244,12 +244,12 @@ txt.addEventListener('keydown', (e) => {
 txt.addEventListener('blur', commitText);
 
 // ---------- output ----------
-function exportPng() {
+// Crop on whole screenshot pixels, copied 1:1 so it is never resampled; annotations are then drawn at full resolution.
+function exportCanvas() {
   const sx = scaleX(), sy = scaleY();
-  // Snap to whole screenshot pixels and copy 1:1 so the crop is never resampled.
   const px = Math.round(sel.x * sx), py = Math.round(sel.y * sy);
-  const pw = Math.max(1, Math.min(img.naturalWidth - px, Math.round(sel.w * sx)));
-  const ph = Math.max(1, Math.min(img.naturalHeight - py, Math.round(sel.h * sy)));
+  const pw = Math.max(1, Math.min(img.width - px, Math.round(sel.w * sx)));
+  const ph = Math.max(1, Math.min(img.height - py, Math.round(sel.h * sy)));
   const out = document.createElement('canvas');
   out.width = pw; out.height = ph;
   const c = out.getContext('2d');
@@ -258,34 +258,57 @@ function exportPng() {
   c.imageSmoothingEnabled = true;
   c.setTransform(sx, 0, 0, sy, -px, -py);
   anns.forEach((a) => drawAnn(c, a));
-  return out.toDataURL('image/png').split(',')[1];
+  return out;
 }
-async function copyNow(silent) {
-  if (!sel) return;
-  try { await invoke('copy_image', { data: exportPng() }); if (!silent) toast('Copied to clipboard'); }
-  catch (err) { toast('Copy failed: ' + err); }
+const release = (canvas) => { canvas.width = canvas.height = 0; };  // free the backing store right away
+
+let ipcQueue = Promise.resolve();  // serialises clipboard writes so the newest edit always lands last
+function copyToClipboard(quiet) {
+  if (!sel || !img) return Promise.resolve(false);
+  const out = exportCanvas();  // snapshot now, send later
+  const { width, height } = out;
+  const px = out.getContext('2d').getImageData(0, 0, width, height).data;
+  release(out);
+  const body = new Uint8Array(px.buffer, px.byteOffset, px.byteLength);
+  const job = ipcQueue
+    .then(() => invoke('copy_image', body, { headers: { 'x-width': String(width), 'x-height': String(height) } }))
+    .then(() => { if (!quiet) toast('Copied to clipboard ✓'); return true; },
+          (err) => { toast('Copy failed: ' + err); return false; });
+  ipcQueue = job;
+  return job;
 }
 function scheduleCopy(first) {
   clearTimeout(copyTimer);
-  copyTimer = setTimeout(async () => { await copyNow(true); toast('Copied to clipboard ✓'); }, first ? 0 : 250);
+  copyTimer = setTimeout(() => copyToClipboard(false), first ? 0 : 250);
 }
 let toastT;
 function toast(msg) {
   toastEl.textContent = msg; toastEl.classList.add('show');
   clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove('show'), 1400);
 }
-async function done() { commitText(); clearTimeout(copyTimer); await copyNow(true); close(); }
+async function done() {
+  commitText(); clearTimeout(copyTimer);
+  if (await copyToClipboard(true)) close();  // stay open if the copy failed so nothing is lost
+}
 async function saveFile() {
-  commitText(); clearTimeout(copyTimer); await copyNow(true);
-  try { await invoke('save_image', { data: exportPng() }); } catch (err) { console.error(err); }
-  close();
+  commitText(); clearTimeout(copyTimer);
+  if (!sel || !img) return;
+  const out = exportCanvas();
+  const blob = await new Promise((resolve) => out.toBlob(resolve, 'image/png'));
+  release(out);
+  if (!blob) { toast('Save failed'); return; }
+  await copyToClipboard(true);
+  try { await invoke('save_image', new Uint8Array(await blob.arrayBuffer())); close(); }
+  catch (err) { toast('Save failed: ' + err); }
 }
 function undo() { commitText(); anns.pop(); render(); scheduleCopy(); }
 function close() {
-  drag = null; cur = null; sel = null; anns = []; img = null;
+  clearTimeout(copyTimer);
+  drag = null; cur = null; sel = null; anns = []; armed = false;
+  if (img) { img.close(); img = null; }  // release the full-screen bitmap
   bar.style.display = 'none'; txt.style.display = 'none';
   ctx.clearRect(0, 0, innerWidth, innerHeight);
-  invoke('hide_overlay');
+  invoke('hide_overlay').catch(console.error);
 }
 
 addEventListener('keydown', (e) => {
@@ -298,11 +321,24 @@ addEventListener('keydown', (e) => {
   if (!e.metaKey && !e.ctrlKey && !e.altKey && KEYS[e.key.toLowerCase()]) setTool(KEYS[e.key.toLowerCase()]);
 });
 addEventListener('contextmenu', (e) => { e.preventDefault(); close(); });
+cv.addEventListener('pointercancel', () => { drag = null; cur = null; render(); });
+
+// Losing focus (Cmd+Tab, Mission Control...) must never leave a screen-covering overlay stuck on top.
+let armed = false;
+addEventListener('focus', () => { armed = true; });
+addEventListener('blur', () => { if (armed && img) close(); });
 
 // ---------- lifecycle ----------
-listen('shot', (ev) => {
-  const im = new Image();
-  im.onload = () => { fit(); img = im; sel = null; anns = []; cur = null; render(); };
-  im.src = ev.payload;
+listen('shot', async () => {
+  try {
+    const png = await invoke('take_shot');  // raw binary IPC response, no base64
+    const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
+    if (img) img.close();
+    fit(); img = bitmap; sel = null; anns = []; cur = null; render();
+    armed = document.hasFocus();
+  } catch (err) {
+    console.error(err);
+    invoke('hide_overlay').catch(console.error);
+  }
 });
 fit();

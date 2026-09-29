@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-take-shot"
+description = "Enables the take_shot command without any pre-configured scope."
+commands.allow = ["take_shot"]
+
+[[permission]]
+identifier = "deny-take-shot"
+description = "Denies the take_shot command without any pre-configured scope."
+commands.deny = ["take_shot"]

@@ -1,32 +1,115 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
-use std::path::PathBuf;
+//! Flick: a Flameshot-style screenshot tool for macOS.
+//!
+//! Flow: global hotkey -> `screencapture` grabs the display under the cursor into a private temp
+//! file -> the PNG is held in memory and handed to the overlay window as a raw binary IPC
+//! response (no base64) -> the overlay crops and annotates -> the result comes back as raw
+//! RGBA (clipboard) or PNG bytes (save).
+
+use std::{
+    borrow::Cow,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
+};
 use tauri::{
+    ipc::{InvokeBody, Request, Response},
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const DEFAULT_SHORTCUT: &str = "Super+Shift+A";
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bounds for data coming back from the webview (defence in depth; it is our own page).
+const MAX_DIMENSION: usize = 32_768;
+const MAX_BYTES: usize = 512 * 1024 * 1024;
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
-fn config_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_default().join("Flick").join("config.json")
+/// The screenshot waiting to be picked up by the overlay, and a guard against overlapping captures.
+#[derive(Default)]
+struct Shot {
+    png: Mutex<Option<Vec<u8>>>,
+    busy: AtomicBool,
 }
 
-/// Shortcut string from ~/Library/Application Support/Flick/config.json, e.g. {"shortcut":"Super+Shift+X"}.
-fn configured_shortcut() -> String {
-    std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["shortcut"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| DEFAULT_SHORTCUT.to_owned())
+impl Shot {
+    fn png(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.png.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
+
+// ---------------------------------------------------------------- macOS FFI
 
 #[cfg(target_os = "macos")]
-fn float_above_everything(win: &WebviewWindow) {
-    use objc2::{msg_send, runtime::AnyObject};
-    if let Ok(ptr) = win.ns_window() {
-        // Level above the menu bar and Dock; join every Space and full-screen apps.
+mod sys {
+    use std::ffi::c_void;
+    use tauri::WebviewWindow;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+        fn CGEventCreate(source: *const c_void) -> *mut c_void;
+        fn CGEventGetLocation(event: *const c_void) -> CGPoint;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    pub fn has_screen_access() -> bool {
+        // SAFETY: no arguments, no pointers; plain query.
+        unsafe { CGPreflightScreenCaptureAccess() }
+    }
+
+    /// Triggers the system permission prompt (once) if access was never decided.
+    pub fn request_screen_access() {
+        // SAFETY: no arguments, no pointers.
+        unsafe {
+            CGRequestScreenCaptureAccess();
+        }
+    }
+
+    /// Cursor position in global display points (origin top-left of the primary display), the
+    /// same space `screencapture -R` and `CGDisplayBounds` use.
+    pub fn cursor() -> Option<(f64, f64)> {
+        // SAFETY: CGEventCreate(NULL) returns an owned event or NULL; we null-check and release it.
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return None;
+            }
+            let p = CGEventGetLocation(event);
+            CFRelease(event);
+            Some((p.x, p.y))
+        }
+    }
+
+    /// Put the overlay above the menu bar and Dock, on every Space and over full-screen apps.
+    /// Must run on the main thread.
+    pub fn float_above_everything(win: &WebviewWindow) {
+        use objc2::{msg_send, runtime::AnyObject};
+        let Ok(ptr) = win.ns_window() else { return };
+        if ptr.is_null() {
+            return;
+        }
+        // SAFETY: `ptr` is the live NSWindow backing `win`; both selectors exist on NSWindow and
+        // take NSInteger / NSUInteger. Called on the main thread by the callers.
         unsafe {
             let w = &*(ptr as *const AnyObject);
             let _: () = msg_send![w, setLevel: 1001isize];
@@ -36,79 +119,276 @@ fn float_above_everything(win: &WebviewWindow) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn float_above_everything(_: &WebviewWindow) {}
-
-fn capture(app: &AppHandle) {
-    let Some(win) = app.get_webview_window("overlay") else { return };
-    if win.is_visible().unwrap_or(false) {
-        return;
+mod sys {
+    use tauri::WebviewWindow;
+    pub fn has_screen_access() -> bool {
+        true
     }
-    let tmp = std::env::temp_dir().join("flick-capture.png");
-    let ok = std::process::Command::new("/usr/sbin/screencapture")
-        .args(["-x", "-t", "png"])
-        .arg(&tmp)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let Ok(bytes) = std::fs::read(&tmp) else {
-        eprintln!("capture failed (ok={ok})");
-        return;
-    };
-    let _ = std::fs::remove_file(&tmp);
-
-    if let Ok(Some(mon)) = win.primary_monitor() {
-        let scale = mon.scale_factor();
-        let pos = mon.position().to_logical::<f64>(scale);
-        let size = mon.size().to_logical::<f64>(scale);
-        let _ = win.set_position(pos);
-        let _ = win.set_size(size);
+    pub fn request_screen_access() {}
+    pub fn cursor() -> Option<(f64, f64)> {
+        None
     }
-    let _ = win.emit("shot", format!("data:image/png;base64,{}", STANDARD.encode(bytes)));
-    float_above_everything(&win);
-    let _ = win.show();
-    let _ = win.set_focus();
+    pub fn float_above_everything(_: &WebviewWindow) {}
 }
 
+// ---------------------------------------------------------------- config
+
+fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_default()
+        .join("Flick")
+        .join("config.json")
+}
+
+/// Hotkey from `~/Library/Application Support/Flick/config.json`, e.g. `{"shortcut":"Super+Shift+X"}`.
+fn configured_shortcut() -> String {
+    std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["shortcut"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| DEFAULT_SHORTCUT.to_owned())
+}
+
+// ---------------------------------------------------------------- capture
+
+/// Rectangle (in global points) of the monitor under the cursor, falling back to the primary one.
+fn target_rect(win: &WebviewWindow) -> Result<(f64, f64, f64, f64), String> {
+    let rects: Vec<_> = win
+        .available_monitors()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|m| {
+            let s = m.scale_factor();
+            let p = m.position().to_logical::<f64>(s);
+            let z = m.size().to_logical::<f64>(s);
+            (p.x, p.y, z.width, z.height)
+        })
+        .collect();
+    let under_cursor = sys::cursor().and_then(|(cx, cy)| {
+        rects
+            .iter()
+            .copied()
+            .find(|&(x, y, w, h)| cx >= x && cx < x + w && cy >= y && cy < y + h)
+    });
+    if let Some(r) = under_cursor {
+        return Ok(r);
+    }
+    let primary = win.primary_monitor().map_err(|e| e.to_string())?;
+    primary
+        .map(|m| {
+            let s = m.scale_factor();
+            let p = m.position().to_logical::<f64>(s);
+            let z = m.size().to_logical::<f64>(s);
+            (p.x, p.y, z.width, z.height)
+        })
+        .or_else(|| rects.first().copied())
+        .ok_or_else(|| "no monitor found".to_owned())
+}
+
+fn run_screencapture(rect: (f64, f64, f64, f64), out: &Path) -> Result<(), String> {
+    let (x, y, w, h) = rect;
+    let mut child = Command::new("/usr/sbin/screencapture")
+        .args(["-x", "-t", "png"])
+        .arg(format!(
+            "-R{},{},{},{}",
+            x.round() as i64,
+            y.round() as i64,
+            w.round() as i64,
+            h.round() as i64
+        ))
+        .arg(out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run screencapture: {e}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("screencapture failed: {status}")),
+            None if started.elapsed() > CAPTURE_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("screencapture timed out".into());
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn capture_inner(app: &AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("overlay")
+        .ok_or("overlay window missing")?;
+    if win.is_visible().unwrap_or(false) {
+        return Err("overlay already open".into());
+    }
+    if !sys::has_screen_access() {
+        sys::request_screen_access();
+        return Err("Screen Recording permission missing".into());
+    }
+    let rect = target_rect(&win)?;
+
+    // Private (0600) unique temp file, removed on drop even on error paths.
+    let tmp = tempfile::Builder::new()
+        .prefix("flick-")
+        .suffix(".png")
+        .tempfile()
+        .map_err(|e| e.to_string())?;
+    run_screencapture(rect, tmp.path())?;
+    let png = std::fs::read(tmp.path()).map_err(|e| e.to_string())?;
+    drop(tmp);
+    if png.len() > MAX_BYTES || !png.starts_with(&PNG_MAGIC) {
+        return Err("screencapture produced no valid PNG".into());
+    }
+    *app.state::<Shot>().png() = Some(png);
+
+    let (x, y, w, h) = rect;
+    let _ = win.set_position(LogicalPosition::new(x, y));
+    let _ = win.set_size(LogicalSize::new(w, h));
+    win.emit("shot", ()).map_err(|e| e.to_string())?;
+    let shown = win.clone();
+    app.run_on_main_thread(move || {
+        sys::float_above_everything(&shown);
+        let _ = shown.show();
+        let _ = shown.set_focus();
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn capture(app: &AppHandle) {
+    if app.state::<Shot>().busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    // Never block the event loop on a subprocess.
+    std::thread::spawn(move || {
+        if let Err(e) = capture_inner(&app) {
+            eprintln!("flick: {e}");
+            app.state::<Shot>().busy.store(false, Ordering::Release);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- IPC commands
+
+fn raw_body<'a>(request: &'a Request<'_>) -> Result<&'a [u8], String> {
+    match request.body() {
+        InvokeBody::Raw(bytes) => Ok(bytes),
+        InvokeBody::Json(_) => Err("expected a raw binary body".into()),
+    }
+}
+
+fn header_usize(request: &Request<'_>, name: &str) -> Result<usize, String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("missing or invalid header {name}"))
+}
+
+/// Checks that `len` is exactly a `width` x `height` RGBA buffer within sane limits.
+fn validate_rgba(width: usize, height: usize, len: usize) -> Result<(), String> {
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(format!("bad image size {width}x{height}"));
+    }
+    match width.checked_mul(height).and_then(|p| p.checked_mul(4)) {
+        Some(expected) if expected == len && len <= MAX_BYTES => Ok(()),
+        _ => Err("pixel buffer does not match dimensions".into()),
+    }
+}
+
+/// Hands the pending screenshot (raw PNG bytes) to the overlay, freeing our copy.
 #[tauri::command]
-fn copy_image(data: String) -> Result<(), String> {
-    let png = STANDARD.decode(data).map_err(|e| e.to_string())?;
-    let img = image::load_from_memory(&png).map_err(|e| e.to_string())?.to_rgba8();
-    let (w, h) = img.dimensions();
+async fn take_shot(state: State<'_, Shot>) -> Result<Response, String> {
+    state
+        .png()
+        .take()
+        .map(Response::new)
+        .ok_or_else(|| "no screenshot pending".to_owned())
+}
+
+/// Body: raw RGBA pixels. Headers: `x-width`, `x-height`.
+#[tauri::command]
+async fn copy_image(request: Request<'_>) -> Result<(), String> {
+    let (w, h) = (
+        header_usize(&request, "x-width")?,
+        header_usize(&request, "x-height")?,
+    );
+    let rgba = raw_body(&request)?;
+    validate_rgba(w, h, rgba.len())?;
     arboard::Clipboard::new()
         .and_then(|mut c| {
             c.set_image(arboard::ImageData {
-                width: w as usize,
-                height: h as usize,
-                bytes: img.into_raw().into(),
+                width: w,
+                height: h,
+                bytes: Cow::Borrowed(rgba),
             })
         })
         .map_err(|e| e.to_string())
 }
 
+/// Body: raw PNG bytes. Saved to the Desktop without ever overwriting an existing file.
 #[tauri::command]
-fn save_image(data: String) -> Result<String, String> {
-    let png = STANDARD.decode(data).map_err(|e| e.to_string())?;
-    let stamp = std::process::Command::new("date")
+async fn save_image(request: Request<'_>) -> Result<String, String> {
+    let png = raw_body(&request)?;
+    if png.len() > MAX_BYTES || !png.starts_with(&PNG_MAGIC) {
+        return Err("not a PNG".into());
+    }
+    let stamp = Command::new("/bin/date")
         .arg("+%Y-%m-%d at %H.%M.%S")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|_| "shot".into());
-    let path = dirs::desktop_dir().unwrap_or_default().join(format!("Flick {stamp}.png"));
-    std::fs::write(&path, png).map_err(|e| e.to_string())?;
-    Ok(path.display().to_string())
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "shot".into());
+    let dir = dirs::desktop_dir().ok_or("no Desktop folder")?;
+    for n in 0..1000 {
+        let name = if n == 0 {
+            format!("Flick {stamp}.png")
+        } else {
+            format!("Flick {stamp} ({n}).png")
+        };
+        let path = dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                f.write_all(png).map_err(|e| e.to_string())?;
+                return Ok(path.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("could not find a free file name".into())
 }
 
 #[tauri::command]
-fn hide_overlay(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("overlay") {
-        let _ = w.hide();
+async fn hide_overlay(app: AppHandle, state: State<'_, Shot>) -> Result<(), String> {
+    *state.png() = None;
+    state.busy.store(false, Ordering::Release);
+    match app.get_webview_window("overlay") {
+        Some(w) => w.hide().map_err(|e| e.to_string()),
+        None => Ok(()),
     }
 }
 
+// ---------------------------------------------------------------- app
+
 pub fn run() {
     tauri::Builder::default()
+        // Must be first. Launching Flick again just triggers a capture.
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| capture(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![copy_image, save_image, hide_overlay])
+        .manage(Shot::default())
+        .invoke_handler(tauri::generate_handler![
+            take_shot,
+            copy_image,
+            save_image,
+            hide_overlay
+        ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -122,26 +402,46 @@ pub fn run() {
                 .visible(false)
                 .build()?;
 
-            let shortcut_str = configured_shortcut();
-            let shortcut: Shortcut = shortcut_str.parse().unwrap_or_else(|_| DEFAULT_SHORTCUT.parse().unwrap());
-            app.global_shortcut().on_shortcut(shortcut, |app, _, ev| {
+            let requested = configured_shortcut();
+            let shortcut: Shortcut = requested.parse().unwrap_or_else(|_| {
+                eprintln!("flick: invalid shortcut {requested:?}, using {DEFAULT_SHORTCUT}");
+                DEFAULT_SHORTCUT.parse().expect("default shortcut is valid")
+            });
+            // A hotkey owned by another app must not stop Flick from starting; the tray still works.
+            let hotkey_label = match app.global_shortcut().on_shortcut(shortcut, |app, _, ev| {
                 if ev.state() == ShortcutState::Pressed {
                     capture(app);
                 }
-            })?;
+            }) {
+                Ok(()) => shortcut.into_string(),
+                Err(e) => {
+                    eprintln!("flick: cannot register hotkey: {e}");
+                    "hotkey unavailable".to_owned()
+                }
+            };
 
-            let capture_item = MenuItem::with_id(app, "capture", format!("Capture  ({shortcut_str})"), true, None::<&str>)?;
+            let capture_item = MenuItem::with_id(
+                app,
+                "capture",
+                format!("Capture  ({hotkey_label})"),
+                true,
+                None::<&str>,
+            )?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Flick", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&capture_item, &quit_item])?;
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(
+                    app.default_window_icon()
+                        .expect("bundle has an icon")
+                        .clone(),
+                )
                 .menu(&menu)
                 .on_menu_event(|app, ev| match ev.id().as_ref() {
                     "capture" => {
                         let app = app.clone();
                         // Let the tray menu close before grabbing the screen.
                         std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(250));
+                            std::thread::sleep(Duration::from_millis(250));
                             capture(&app);
                         });
                     }
@@ -153,4 +453,33 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Flick");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_validation_accepts_exact_buffers() {
+        assert!(validate_rgba(10, 5, 10 * 5 * 4).is_ok());
+    }
+
+    #[test]
+    fn rgba_validation_rejects_bad_input() {
+        assert!(validate_rgba(0, 5, 0).is_err());
+        assert!(validate_rgba(10, 5, 10 * 5 * 4 - 1).is_err());
+        assert!(validate_rgba(MAX_DIMENSION + 1, 1, (MAX_DIMENSION + 1) * 4).is_err());
+        assert!(validate_rgba(usize::MAX, usize::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn default_shortcut_parses() {
+        assert!(DEFAULT_SHORTCUT.parse::<Shortcut>().is_ok());
+    }
+
+    #[test]
+    fn png_magic_is_checked() {
+        assert!(PNG_MAGIC.starts_with(&[0x89, b'P']));
+        assert!(!b"GIF89a".starts_with(&PNG_MAGIC));
+    }
 }
