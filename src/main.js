@@ -16,7 +16,7 @@ const TOOLS = [
 ];
 const KEYS = { p: 'pen', l: 'line', a: 'arrow', r: 'rect', e: 'ellipse', m: 'marker', t: 'text' };
 
-let img = null;                 // frozen screenshot (ImageBitmap)
+let shot = null;                // {w,h}: pixel size of the frozen screen, shown natively under this page
 let sel = null;                 // {x,y,w,h} in CSS px
 let anns = [];                  // committed annotations
 let cur = null;                 // annotation being drawn
@@ -116,13 +116,20 @@ function drawAnn(c, a) {
   c.restore();
 }
 
+// The page itself is transparent. Until a selection starts nothing is drawn at all, so the
+// overlay looks exactly like the live screen (like ⌘⇧4); the dim then fades in around the selection.
+const DIM = 0.45, FADE_MS = 140;
+let fadeStart = null, fadeQueued = false;
+function dimAlpha() {
+  if (fadeStart === null) fadeStart = performance.now();
+  const t = Math.min(1, (performance.now() - fadeStart) / FADE_MS);
+  if (t < 1 && !fadeQueued) { fadeQueued = true; requestAnimationFrame(() => { fadeQueued = false; render(); }); }
+  return DIM * t;
+}
 function render() {
   ctx.clearRect(0, 0, innerWidth, innerHeight);
-  if (!img) return;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(img, 0, 0, innerWidth, innerHeight);
-  ctx.fillStyle = 'rgba(0,0,0,.45)';
-  if (!sel) { ctx.fillRect(0, 0, innerWidth, innerHeight); return; }
+  if (!shot || !sel) { fadeStart = null; return; }
+  ctx.fillStyle = `rgba(0,0,0,${dimAlpha()})`;
   ctx.beginPath();
   ctx.rect(0, 0, innerWidth, innerHeight); ctx.rect(sel.x, sel.y, sel.w, sel.h);
   ctx.fill('evenodd');
@@ -139,8 +146,8 @@ function render() {
   ctx.fillStyle = '#1d1d1f'; ctx.fillRect(sel.x, ly, tw, 18);
   ctx.fillStyle = '#fff'; ctx.textBaseline = 'middle'; ctx.fillText(label, sel.x + 6, ly + 9);
 }
-const scaleX = () => img.width / innerWidth;
-const scaleY = () => img.height / innerHeight;
+const scaleX = () => shot.w / innerWidth;
+const scaleY = () => shot.h / innerHeight;
 
 // ---------- selection handles ----------
 function handles() {
@@ -159,7 +166,7 @@ const norm = (r) => ({ x: Math.min(r.x1, r.x2), y: Math.min(r.y1, r.y2), w: Math
 
 // ---------- pointer ----------
 cv.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || !shot) return;
   commitText();
   cv.setPointerCapture(e.pointerId);
   const x = e.clientX, y = e.clientY;
@@ -242,77 +249,69 @@ txt.addEventListener('keydown', (e) => {
 txt.addEventListener('blur', commitText);
 
 // ---------- output ----------
-// Crop on whole screenshot pixels, copied 1:1 so it is never resampled; annotations are then drawn at full resolution.
-function exportCanvas() {
+// The crop is cut natively from the frozen screen, so it is never resampled or re-encoded here.
+// Only the annotations travel, as a transparent layer drawn at full screenshot resolution.
+function cropRect() {
   const sx = scaleX(), sy = scaleY();
-  const px = Math.round(sel.x * sx), py = Math.round(sel.y * sy);
-  const pw = Math.max(1, Math.min(img.width - px, Math.round(sel.w * sx)));
-  const ph = Math.max(1, Math.min(img.height - py, Math.round(sel.h * sy)));
-  const out = document.createElement('canvas');
-  out.width = pw; out.height = ph;
-  const c = out.getContext('2d');
-  c.imageSmoothingEnabled = false;
-  c.drawImage(img, px, py, pw, ph, 0, 0, pw, ph);
-  c.imageSmoothingEnabled = true;
-  c.setTransform(sx, 0, 0, sy, -px, -py);
-  anns.forEach((a) => drawAnn(c, a));
-  return out;
+  const x = Math.min(shot.w - 1, Math.max(0, Math.round(sel.x * sx)));
+  const y = Math.min(shot.h - 1, Math.max(0, Math.round(sel.y * sy)));
+  const w = Math.max(1, Math.min(shot.w - x, Math.round(sel.w * sx)));
+  const h = Math.max(1, Math.min(shot.h - y, Math.round(sel.h * sy)));
+  return { x, y, w, h };
 }
-const release = (canvas) => { canvas.width = canvas.height = 0; };  // free the backing store right away
-
-// The clipboard is written only when the user commits (Enter, ⌘C, ✓, ⌘S). Cancelling (Esc, ✕,
-// right-click, Cmd+Tab away) leaves whatever was on the clipboard untouched, and drawing never
-// pays for an export.
-async function sendToClipboard(out) {
-  const { width, height } = out;
-  const px = out.getContext('2d').getImageData(0, 0, width, height).data;
-  const body = new Uint8Array(px.buffer, px.byteOffset, px.byteLength);
-  try {
-    await invoke('copy_image', body, { headers: { 'x-width': String(width), 'x-height': String(height) } });
-    return true;
-  } catch (err) {
-    toast('Copy failed: ' + err);
-    return false;
-  }
+function annotationLayer(r) {
+  if (!anns.length) return new Uint8Array(0);
+  const out = document.createElement('canvas');
+  out.width = r.w; out.height = r.h;
+  const c = out.getContext('2d');
+  c.setTransform(scaleX(), 0, 0, scaleY(), -r.x, -r.y);
+  anns.forEach((a) => drawAnn(c, a));
+  const px = c.getImageData(0, 0, r.w, r.h).data;
+  out.width = out.height = 0;  // free the backing store right away
+  return new Uint8Array(px.buffer, px.byteOffset, px.byteLength);
 }
 let toastT;
 function toast(msg) {
   toastEl.textContent = msg; toastEl.classList.add('show');
   clearTimeout(toastT); toastT = setTimeout(() => toastEl.classList.remove('show'), 1400);
 }
+// The clipboard is written only when the user commits (Enter, ⌘C, ✓, ⌘S). Cancelling (Esc, ✕,
+// right-click, Cmd+Tab away) leaves whatever was on the clipboard untouched.
 let committing = false;  // Enter pressed twice must not export twice
-async function done() {
+async function finish(save) {
   commitText();
-  if (!sel || !img || committing) return;
+  if (!sel || !shot || committing) return;
   committing = true;
-  const out = exportCanvas();
-  const ok = await sendToClipboard(out);
-  release(out);
-  committing = false;
-  if (ok) close();  // stay open if the copy failed so nothing is lost
-}
-async function saveFile() {
-  commitText();
-  if (!sel || !img || committing) return;
-  committing = true;
-  const out = exportCanvas();  // rendered once, used for both the file and the clipboard
-  const blob = await new Promise((resolve) => out.toBlob(resolve, 'image/png'));
-  const copied = await sendToClipboard(out);
-  release(out);
-  committing = false;
-  if (!blob) { toast('Save failed'); return; }
+  const r = cropRect();
   try {
-    await invoke('save_image', new Uint8Array(await blob.arrayBuffer()));
-    if (copied) close();
-  } catch (err) { toast('Save failed: ' + err); }
+    await invoke('finish', annotationLayer(r), { headers: {
+      'x-x': String(r.x), 'x-y': String(r.y), 'x-width': String(r.w), 'x-height': String(r.h),
+      'x-save': save ? '1' : '0',
+    } });
+    committing = false;
+    close();
+  } catch (err) {
+    committing = false;
+    toast(String(err));  // stay open so nothing is lost
+  }
 }
+const done = () => finish(false);
+const saveFile = () => finish(true);
 function undo() { commitText(); anns.pop(); render(); }
-function close() {
-  drag = null; cur = null; sel = null; anns = []; armed = false; committing = false;
-  if (img) { img.close(); img = null; }  // release the full-screen bitmap
+// Wait for a painted frame (bounded, in case the page is not being rendered at all).
+const nextFrame = () => new Promise((r) => { requestAnimationFrame(() => r()); setTimeout(r, 50); });
+let closing = false;
+async function close() {
+  if (closing) return;
+  closing = true;
+  drag = null; cur = null; sel = null; anns = []; armed = false; committing = false; shot = null;
   bar.style.display = 'none'; txt.style.display = 'none';
-  ctx.clearRect(0, 0, innerWidth, innerHeight);
-  invoke('hide_overlay').catch(console.error);
+  render();
+  // Let WebKit present the cleared page before the window hides, so the next capture never
+  // shows a frame of this one.
+  await nextFrame(); await nextFrame();
+  await invoke('hide_overlay').catch(console.error);
+  closing = false;
 }
 
 addEventListener('keydown', (e) => {
@@ -330,36 +329,19 @@ cv.addEventListener('pointercancel', () => { drag = null; cur = null; render(); 
 // Losing focus (Cmd+Tab, Mission Control...) must never leave a screen-covering overlay stuck on top.
 let armed = false;
 addEventListener('focus', () => { armed = true; });
-addEventListener('blur', () => { if (armed && img) close(); });
+addEventListener('blur', () => { if (armed && shot) close(); });
 
 // ---------- lifecycle ----------
-// The backend stores the screenshot, emits `shot`, then shows this window. If the hotkey is
-// pressed while this page is still loading, that event is lost, so the page also asks once at
-// startup. Both paths share one in-flight request, so the screenshot is never taken twice.
-let pulling = null;
-function pull(fromEvent) {
-  if (!pulling) pulling = doPull(fromEvent).finally(() => { pulling = null; });
-  return pulling;
+// The backend freezes the screen under this page, then emits `shot` with its pixel size and shows
+// the window. If the hotkey is pressed while the page is still loading that event is lost, so the
+// page also asks once at startup.
+function open(size) {
+  if (!Array.isArray(size) || closing) return;
+  const [w, h] = size;
+  shot = { w, h }; sel = null; anns = []; cur = null; drag = null; committing = false;
+  bar.style.display = 'none'; txt.style.display = 'none';
+  fit(); render();
+  armed = document.hasFocus();
 }
-async function doPull(fromEvent) {
-  let png;
-  try {
-    png = await invoke('take_shot');  // raw binary IPC response, no base64
-  } catch (err) {
-    // Nothing pending is normal on the startup check; after an event it means the overlay
-    // would open empty, so close it (unless another pull already filled it).
-    if (fromEvent && !img) invoke('hide_overlay').catch(console.error);
-    return;
-  }
-  try {
-    const bitmap = await createImageBitmap(new Blob([png], { type: 'image/png' }));
-    if (img) img.close();
-    fit(); img = bitmap; sel = null; anns = []; cur = null; render();
-    armed = document.hasFocus();
-  } catch (err) {
-    console.error(err);
-    invoke('hide_overlay').catch(console.error);
-  }
-}
-listen('shot', () => pull(true)).then(() => pull(false));
+listen('shot', (e) => open(e.payload)).then(() => invoke('shot_info').then(open, () => {}));
 fit();

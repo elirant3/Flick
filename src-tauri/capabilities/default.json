@@ -1,14 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Least privilege for the overlay: listen for the capture event and call four app commands.",
+  "description": "Least privilege for the overlay: listen for the capture event and call three app commands.",
   "windows": ["overlay"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "allow-take-shot",
-    "allow-copy-image",
-    "allow-save-image",
+    "allow-shot-info",
+    "allow-finish",
     "allow-hide-overlay"
   ]
 }

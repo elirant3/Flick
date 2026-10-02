@@ -4,6 +4,8 @@ A Flameshot-style screenshot tool for macOS. Built with Rust + Tauri.
 
 Press **⌘⇧2**, drag a region, annotate if you want, and press **Enter**: it's on your clipboard. Cancelling never touches the clipboard.
 
+Like macOS's own ⌘⇧4, the crosshair shows up instantly and the screen doesn't flash, dim or jump: the frozen frame is pixel-identical to what you were looking at, and the dim only fades in around your selection once you start dragging.
+
 ## Tools
 
 Pen (P) · Line (L) · Arrow (A) · Rectangle (R) · Circle (E) · Marker (M) · Text (T), with 7 colors and 3 sizes.
@@ -45,13 +47,14 @@ If the hotkey is taken by another app Flick still starts; use the menu bar item 
 
 ## Design notes
 
-- **Memory:** the screenshot moves to the overlay as a raw binary IPC response (no base64/JSON), the full-screen bitmap is freed on close, and the pixel buffer for the clipboard is released immediately after sending. Nothing is cached on disk.
-- **Clipboard on commit only:** drawing never exports anything; the crop is rendered once when you press Enter, ⌘C or ⌘S (⌘S reuses that one render for the file and the clipboard).
+- **No flash:** the display under the cursor is grabbed in-process with CoreGraphics (a few ms, no subprocess, no PNG encode/decode) and shown natively by a layer *under* a transparent webview, set before the window is ordered in. The webview only draws the selection and annotations, and clears its last frame before hiding so the next capture never shows a stale one. `screencapture` is kept as a fallback.
+- **Memory:** the full screen never crosses into the webview. On commit the crop is cut natively from the frozen image and converted to sRGB, and only the annotation layer (raw RGBA, empty if you didn't draw) travels over IPC. Everything is freed on close; nothing is cached on disk.
+- **Clipboard on commit only:** drawing never exports anything; the crop is rendered once when you press Enter, ⌘C or ⌘S (⌘S reuses that one render for the file and the clipboard, PNG-encoded in Rust).
 - **Menu bar icon:** a black-on-transparent template image (`scripts/gen_tray_icon.php`), so macOS tints it for light and dark menu bars.
-- **Temp files:** the capture goes to a private (0600) unique temp file that is deleted right away, including on error paths.
-- **Least privilege:** strict CSP (no inline script/style, no remote origins), frozen prototypes, and the overlay window may only call four app commands plus event listening. The webview can't touch the filesystem or shell.
-- **Input validation:** clipboard/save payloads are size-checked (`width × height × 4` must match exactly, 32 768 px and 512 MB caps); saves never overwrite an existing file.
-- **Robustness:** no work on the UI thread (capture runs in a worker with a 5 s timeout), overlapping captures are ignored, AppKit calls run on the main thread, the overlay closes if it loses focus, and a missing Screen Recording permission is detected up front instead of capturing a blank wallpaper.
+- **Temp files:** none on the normal path. The `screencapture` fallback writes to a private (0600) unique temp file that is deleted right away, including on error paths.
+- **Least privilege:** strict CSP (no inline script/style, no remote origins), frozen prototypes, and the overlay window may only call three app commands plus event listening. The webview can't touch the filesystem or shell.
+- **Input validation:** the crop must lie inside the screenshot and the annotation layer must be exactly `width × height × 4` (32 768 px and 512 MB caps); saves never overwrite an existing file.
+- **Robustness:** no work on the UI thread (capture runs in a worker; the fallback has a 5 s timeout), overlapping captures are ignored, AppKit calls run on the main thread, the overlay closes if it loses focus, and a missing Screen Recording permission is detected up front instead of capturing a blank wallpaper.
 
 ## License
 
