@@ -311,6 +311,8 @@ async function close() {
   // shows a frame of this one.
   await nextFrame(); await nextFrame();
   await invoke('hide_overlay').catch(console.error);
+  // Hidden between captures: give the full-screen canvas backing store back (open() re-creates it).
+  if (!shot) cv.width = cv.height = 0;
   closing = false;
 }
 

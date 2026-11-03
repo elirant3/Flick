@@ -248,6 +248,14 @@ mod sys {
         }
     }
 
+    /// Runs `f` inside an autorelease pool. Threads that are not driven by AppKit's run loop (our
+    /// capture thread, Tauri's async workers) have no pool, so every autoreleased object a Cocoa
+    /// call creates there (the NSPasteboard write makes a TIFF and a bitmap rep per copy) would
+    /// otherwise live until the process exits.
+    pub fn autorelease<R>(f: impl FnOnce() -> R) -> R {
+        objc2::rc::autoreleasepool(|_| f())
+    }
+
     pub fn has_screen_access() -> bool {
         // SAFETY: no arguments, no pointers; plain query.
         unsafe { CGPreflightScreenCaptureAccess() }
@@ -403,6 +411,9 @@ mod sys {
             None
         }
     }
+    pub fn autorelease<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
     pub fn has_screen_access() -> bool {
         true
     }
@@ -527,7 +538,7 @@ fn capture(app: &AppHandle) {
     let app = app.clone();
     // Never block the event loop on the capture.
     std::thread::spawn(move || {
-        if let Err(e) = capture_inner(&app) {
+        if let Err(e) = sys::autorelease(|| capture_inner(&app)) {
             eprintln!("flick: {e}");
             *app.state::<Shot>().image() = None;
             app.state::<Shot>().busy.store(false, Ordering::Release);
@@ -668,20 +679,19 @@ async fn finish(request: Request<'_>, state: State<'_, Shot>) -> Result<Option<S
         blend_over(&mut pixels, annotations);
     }
 
-    arboard::Clipboard::new()
-        .and_then(|mut c| {
-            c.set_image(arboard::ImageData {
-                width: w,
-                height: h,
-                bytes: Cow::Borrowed(&pixels),
-            })
+    // Encode before handing the pixels over: the clipboard takes ownership, so it never needs a
+    // second full-size copy of the image.
+    let png = if save { Some(encode_png(&pixels, w, h)?) } else { None };
+    sys::autorelease(|| {
+        arboard::Clipboard::new().and_then(|mut c| {
+            c.set_image(arboard::ImageData { width: w, height: h, bytes: Cow::Owned(pixels) })
         })
-        .map_err(|e| format!("copy failed: {e}"))?;
-    if save {
-        let png = encode_png(&pixels, w, h)?;
-        return save_to_desktop(&png).map(Some).map_err(|e| format!("save failed: {e}"));
+    })
+    .map_err(|e| format!("copy failed: {e}"))?;
+    match png {
+        Some(png) => save_to_desktop(&png).map(Some).map_err(|e| format!("save failed: {e}")),
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 #[tauri::command]
